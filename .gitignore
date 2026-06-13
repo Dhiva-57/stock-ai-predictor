@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment — never commit this
+venv/
+env/
+.venv/
+
+# Database — generated on first run
+stock_system/stocks.db
+
+# ML models — regenerated on each predict
+stock_system/models/
+
+# Cache — regenerated daily
+stock_system/cache/
+
+# Local data files — too large for GitHub
+HistoricalData_1780315577803.csv
+nvda_insider_trades.csv
+NVDA_Live_Options_Chain.csv
+nvidia_full_dataset.csv
+Annual Reports.zip
+SEC files.zip
+
+# Temp files
+*.pkl
+db_test_result.txt
+insider_info.txt
+options_info.txt
+dataset_info.txt
+result.txt
+
+# OS
+.DS_Store
+Thumbs.db
