@@ -12,6 +12,7 @@ env/
 
 # Database — generated on first run
 stock_system/stocks.db
+*.sqlite3
 
 # ML models — regenerated on each predict
 stock_system/models/
