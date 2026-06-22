@@ -1,16 +1,17 @@
 import os
 import json
 import time
-import hashlib
 
 import pandas as pd
 import numpy as np
 import requests
 
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, accuracy_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 import joblib
 
 # Alpha Vantage API key — get a free one at https://www.alphavantage.co/support/#api-key
@@ -61,6 +62,15 @@ FEATURES = [
     "daily_range", "prev_range",
     "pct_change", "volatility5", "volatility10",
     "vol_ratio",
+    # Lag features — strongest predictors
+    "lag1_close", "lag2_close", "lag3_close",
+    "lag1_return", "lag2_return", "lag3_return",
+    # Momentum & trend
+    "momentum5", "momentum10",
+    "ma5_ma20_cross", "ema12_ema26_cross",
+    "close_vs_ma20", "close_vs_bb_mid",
+    "rsi_signal",
+    "atr14",
 ]
 
 # ── Ticker maps for non-standard assets ──────────────────────────────────────
@@ -259,19 +269,6 @@ def _fetch_stooq(symbol: str) -> pd.DataFrame:
     return df
 
 
-def _fetch_nvda_csv() -> pd.DataFrame:
-    csv_path = os.path.join(os.path.dirname(__file__), "..", "..",
-                            "HistoricalData_1780315577803.csv")
-    df = pd.read_csv(csv_path)
-    df.columns = [c.strip() for c in df.columns]
-    for col in ["Close/Last", "Open", "High", "Low"]:
-        df[col] = df[col].astype(str).str.replace("$", "", regex=False).astype(float)
-    df = df.rename(columns={"Close/Last": "close", "Open": "open",
-                             "High": "high",  "Low": "low",
-                             "Volume": "volume", "Date": "date"})
-    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    return df[["date", "open", "high", "low", "close", "volume"]].dropna()
-
 
 def fetch_live_data(ticker: str) -> dict:
     session          = _av_session()
@@ -304,13 +301,6 @@ def fetch_live_data(ticker: str) -> dict:
                 hist = _fetch_stock(av_symbol, session)
             if hist is not None and not hist.empty:
                 _save_cache(ticker, hist)
-        except Exception as e:
-            last_err = str(e)
-
-    # Attempt 3 — NVDA local CSV
-    if (hist is None or hist.empty) and ticker.upper() in ("NVDA", "NVIDIA"):
-        try:
-            hist = _fetch_nvda_csv()
         except Exception as e:
             last_err = str(e)
 
@@ -384,6 +374,14 @@ def _rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    hl  = df["high"] - df["low"]
+    hpc = (df["high"] - df["close"].shift(1)).abs()
+    lpc = (df["low"]  - df["close"].shift(1)).abs()
+    tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=1).mean()
+
+
 def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("date").copy()
     n  = len(df)
@@ -422,8 +420,30 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["vol_ratio"]    = df["volume"] / vol_ma20.replace(0, np.nan)
     df["vol_ratio"]    = df["vol_ratio"].fillna(1.0)
 
+    # Lag features
+    df["lag1_close"]   = df["close"].shift(1)
+    df["lag2_close"]   = df["close"].shift(2)
+    df["lag3_close"]   = df["close"].shift(3)
+    df["lag1_return"]  = df["close"].pct_change(1)
+    df["lag2_return"]  = df["close"].pct_change(2)
+    df["lag3_return"]  = df["close"].pct_change(3)
+
+    # Momentum
+    df["momentum5"]    = df["close"] - df["close"].shift(5)
+    df["momentum10"]   = df["close"] - df["close"].shift(10)
+
+    # Cross signals (numeric)
+    df["ma5_ma20_cross"]    = (df["ma5"] - df["ma20"]) / df["ma20"].replace(0, np.nan)
+    df["ema12_ema26_cross"] = (df["ema12"] - df["ema26"]) / df["ema26"].replace(0, np.nan)
+    df["close_vs_ma20"]     = (df["close"] - df["ma20"]) / df["ma20"].replace(0, np.nan)
+    df["close_vs_bb_mid"]   = (df["close"] - bb_mid) / bb_std.replace(0, np.nan)
+    df["rsi_signal"]        = df["rsi14"] - 50
+
+    # ATR — true volatility measure
+    df["atr14"]        = _atr(df, min(14, n-2))
+
     df["direction"]    = (df["close"] > df["prev_close"]).astype(int)
-    return df.dropna(subset=["prev_close", "macd", "rsi14"])
+    return df.dropna(subset=["prev_close", "macd", "rsi14", "lag3_close"])
 
 
 def _next_trading_day(last_date: str) -> str:
@@ -458,9 +478,14 @@ def train_ticker(ticker: str, hist: pd.DataFrame) -> dict:
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
 
-    reg = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
+    # Gradient Boosting gives higher accuracy than plain RandomForest
+    reg = GradientBoostingRegressor(n_estimators=400, learning_rate=0.05,
+                                    max_depth=5, subsample=0.8, random_state=42)
     reg.fit(X_train_s, yp_train)
-    clf = RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1)
+
+    base_clf = RandomForestClassifier(n_estimators=400, max_depth=10,
+                                      min_samples_leaf=2, random_state=42, n_jobs=-1)
+    clf = CalibratedClassifierCV(base_clf, cv=5, method="isotonic")
     clf.fit(X_train_s, yd_train)
 
     mae     = mean_absolute_error(yp_test, reg.predict(X_test_s))
